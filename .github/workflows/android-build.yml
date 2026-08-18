@@ -1,20 +1,28 @@
-name: Build Android APK
+name: Build, Version & Release APK
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    paths:
+      - 'app/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
-    name: Assemble Debug & Release
+  release:
+    name: Bump Version, Build & Release
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout (full history)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -27,14 +35,109 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Determine next version
+        id: version
+        run: |
+          set -e
+          # Latest tag matching v<digits>... reachable from HEAD
+          LATEST_TAG=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            CURRENT="0.0.0"
+            COMMITS=$(git log --format="%s%n%b" HEAD)
+          else
+            CURRENT="${LATEST_TAG#v}"
+            COMMITS=$(git log --format="%s%n%b" "${LATEST_TAG}..HEAD")
+          fi
+          echo "Previous version: $CURRENT"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          # Conventional-commits style bump
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qiE "BREAKING CHANGE|^(feat|fix|refactor|perf|build)(\(.+\))?!:"; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qiE "^feat(\(.+\))?:"; then
+            BUMP="minor"
+          fi
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          NEW_VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          NEW_TAG="v${NEW_VERSION}"
+
+          # If the computed tag already exists (e.g. re-run), append a build counter
+          if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+            i=1
+            while git rev-parse "${NEW_TAG}+${i}" >/dev/null 2>&1; do
+              i=$((i+1))
+            done
+            NEW_VERSION="${NEW_VERSION}+${i}"
+            NEW_TAG="${NEW_TAG}+${i}"
+          fi
+
+          {
+            echo "new_version=$NEW_VERSION"
+            echo "new_version_code=$NEW_VERSION_CODE"
+            echo "new_tag=$NEW_TAG"
+            echo "previous_tag=$LATEST_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Bump $CURRENT -> $NEW_VERSION ($BUMP)"
+
+      - name: Update version in build.gradle.kts
+        run: |
+          sed -i -E "s/versionCode = [0-9]+/versionCode = ${{ steps.version.outputs.new_version_code }}/" app/build.gradle.kts
+          sed -i -E "s/versionName = \".+\"/versionName = \"${{ steps.version.outputs.new_version }}\"/" app/build.gradle.kts
+          grep -E "version(Code|Name)" app/build.gradle.kts
+
       - name: Build APK (debug + release)
         run: gradle assembleDebug assembleRelease --stacktrace --no-daemon
+
+      - name: Stage APKs with version name
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/debug/app-debug.apk  "artifacts/BeadCraft-${{ steps.version.outputs.new_version }}-debug.apk"
+          cp app/build/outputs/apk/release/app-release.apk "artifacts/BeadCraft-${{ steps.version.outputs.new_version }}-release.apk"
+          ls -la artifacts/
+
+      - name: Commit version bump & push tag
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/build.gradle.kts
+          git commit -m "chore(release): ${{ steps.version.outputs.new_tag }} [skip ci]" || echo "Nothing to commit"
+          git tag "${{ steps.version.outputs.new_tag }}"
+          git push origin "HEAD:${{ github.ref_name }}" --tags
+
+      - name: Build changelog
+        run: |
+          if [ -z "${{ steps.version.outputs.previous_tag }}" ]; then
+            git log --format="- %s" -n 50 HEAD > changelog.md
+          else
+            git log --format="- %s" "${{ steps.version.outputs.previous_tag }}..HEAD" > changelog.md
+          fi
+          echo "----- Changelog -----"
+          cat changelog.md
+
+      - name: Create GitHub Release & upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new_tag }}
+          name: BeadCraft ${{ steps.version.outputs.new_tag }}
+          body_path: changelog.md
+          files: |
+            artifacts/BeadCraft-${{ steps.version.outputs.new_version }}-debug.apk
+            artifacts/BeadCraft-${{ steps.version.outputs.new_version }}-release.apk
+          draft: false
+          prerelease: false
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: BeadCraft-APK
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
+          name: BeadCraft-APK-${{ steps.version.outputs.new_version }}
+          path: artifacts/*.apk
           if-no-files-found: error
